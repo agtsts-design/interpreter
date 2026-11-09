@@ -252,6 +252,7 @@ Translate the user's message from ${fromName} into ${toName}. Your output must a
 }
 
 
+const TIMEOUT_MS = 8000;
 const BACKUP_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"];
 const HANGUL = /[\uac00-\ud7a3]/;
 function rightScript(t, code){
@@ -262,20 +263,42 @@ function rightScript(t, code){
   if (code === "zh-CN") return /[\u4e00-\u9fff]/.test(t);
   return /[A-Za-z]/.test(t);
 }
-async function callGemini(key, model, sys, msg, signal, onText){
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
-    method: "POST", signal,
-    headers: {"Content-Type":"application/json","x-goog-api-key":key},
-    body: JSON.stringify({
-      systemInstruction: {parts:[{text: sys}]},
-      contents: [{role:"user", parts:[{text: msg}]}],
-      generationConfig: {temperature: 0.2}
-    })
-  });
-  if (!res.ok) {
-    let m = ""; try { m = (await res.json()).error?.message || "" } catch {}
-    throw {status: res.status, message: m};
-  }
+function thinkingFor(model){
+  if (/2\.5/.test(model)) return {thinkingBudget: 0};
+  return {thinkingLevel: /lite/.test(model) ? "minimal" : "low"};
+}
+async function callGemini(key, model, sys, msg, signal, onText, withThinking = true){
+  const inner = new AbortController();
+  let timedOut = false;
+  const onOuter = () => inner.abort();
+  signal.addEventListener("abort", onOuter);
+  let timer = setTimeout(() => { timedOut = true; inner.abort(); }, TIMEOUT_MS);
+  try {
+    const gen = {temperature: 0.2};
+    if (withThinking) gen.thinkingConfig = thinkingFor(model);
+    let res;
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+        method: "POST", signal: inner.signal,
+        headers: {"Content-Type":"application/json","x-goog-api-key":key},
+        body: JSON.stringify({
+          systemInstruction: {parts:[{text: sys}]},
+          contents: [{role:"user", parts:[{text: msg}]}],
+          generationConfig: gen
+        })
+      });
+    } catch (e) {
+      if (timedOut) throw {status: "timeout"};
+      throw e;
+    }
+    if (!res.ok) {
+      let m = ""; try { m = (await res.json()).error?.message || "" } catch {}
+      if (res.status === 400 && withThinking && /think/i.test(m)) {
+        clearTimeout(timer); signal.removeEventListener("abort", onOuter);
+        return callGemini(key, model, sys, msg, signal, onText, false);
+      }
+      throw {status: res.status, message: m};
+    }
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "", out = "";
   for (;;) {
@@ -293,7 +316,14 @@ async function callGemini(key, model, sys, msg, signal, onText){
       } catch {}
     }
   }
-  return out.replace(/<\/?text>/g, "").trim();
+    return out.replace(/<\/?text>/g, "").trim();
+  } catch (e) {
+    if (timedOut) throw {status: "timeout"};
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onOuter);
+  }
 }
 
 async function handle(side, text){
@@ -330,7 +360,7 @@ async function handle(side, text){
     } catch (e) {
       if (e?.name === "AbortError") return;
       lastErr = e;
-      const retryable = e?.status === 404 || e?.status === 429 || e?.status >= 500;
+      const retryable = e?.status === "timeout" || e?.status === 404 || e?.status === 429 || e?.status >= 500;
       if (!retryable) break;
     }
   }
@@ -341,9 +371,10 @@ async function handle(side, text){
   else if (e.status === 400 || e.status === 403) m = "API 키를 확인해 주세요 (설정).";
   else if (e.status === 404) m = "모델을 찾을 수 없습니다. 설정에서 모델 이름을 확인해 주세요.";
   else if (e.status === 429) m = "무료 사용 한도에 걸렸습니다. 1분쯤 뒤 다시 시도해 주세요.";
+  else if (e.status === "timeout") m = "응답이 너무 늦습니다. 인터넷 상태를 확인하고 다시 말해 주세요.";
   else if (e.status >= 500) m = "구글 서버가 붐빕니다. 잠시 후 다시 시도해 주세요.";
   else if (!navigator.onLine || e instanceof TypeError) m = "인터넷 연결을 확인해 주세요.";
-  if (e.status) m += `\n(오류 ${e.status}${e.message ? ": " + e.message.slice(0,120) : ""})`;
+  if (e.status && e.status !== "timeout") m += `\n(오류 ${e.status}${e.message ? ": " + e.message.slice(0,120) : ""})`;
   setBig("me", m, "err");
   if (toSide === "them") setBig("them", "…", "hint");
 }
